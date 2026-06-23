@@ -1,0 +1,514 @@
+---
+title: ""
+output:
+  html_document:
+    toc: TRUE
+    toc_depth: 2
+    toc_float: TRUE
+    css: ../assets/report_styles.css
+    highlight: null
+    self_contained: TRUE
+params:
+  PROJECT_NAME: NA
+  BURN_DATE: NA
+  RUNS: NA
+  REPORT_URL: NA
+  LOG_ROW_FILE: NA
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(terra)
+library(sf)
+library(leaflet)
+library(htmlwidgets)
+library(base64enc)
+library(here)
+library(AirMonitor)
+library(MazamaCoreUtils)
+library(lutz)
+library(png)
+library(rvest)
+library(RCurl)
+library(rjson)
+library(curl)
+
+source(here::here("R", "multi_burn_helpers.R"))
+
+make_data_uri <- function(path, mime = "image/png") {
+  if (file.exists(path)) base64enc::dataURI(file = path, mime = mime) else path
+}
+
+download_data_uri <- function(url, mime = "image/png") {
+  tmp <- tempfile(fileext = ".png")
+  tryCatch({
+    curl::curl_download(url, destfile = tmp, quiet = TRUE)
+    base64enc::dataURI(file = tmp, mime = mime)
+  }, error = function(e) url)
+}
+
+fire_icon_uri <- make_data_uri(here::here("assets", "red-fire-flame.png"))
+perm_mon_icon_uri <- download_data_uri("https://github.com/jeremyash/icons/blob/main/perm_mon.png?raw=true")
+temp_mon_icon_uri <- download_data_uri("https://github.com/jeremyash/icons/blob/main/temp_mon.png?raw=true")
+report_icon_uri <- make_data_uri(here::here("www", "favicon_512x512_rounded.png"))
+```
+
+```{r prepare_runs, include=FALSE}
+runs_input <- params$RUNS |>
+  as_tibble() |>
+  mutate(
+    run_id = trimws(as.character(run_id)),
+    burn_name = trimws(as.character(burn_name %||% ""))
+  ) |>
+  filter(!is.na(run_id), nzchar(run_id)) |>
+  slice_head(n = 10)
+
+if (nrow(runs_input) < 1) stop("At least one BlueSky run ID is required.")
+
+run_info <- purrr::map2_dfr(
+  runs_input$run_id,
+  runs_input$burn_name,
+  read_bluesky_run_info
+)
+
+report_tz <- lutz::tz_lookup_coords(
+  lat = mean(run_info$lat, na.rm = TRUE),
+  lon = mean(run_info$lon, na.rm = TRUE),
+  method = "fast"
+)
+
+generated_at <- lubridate::with_tz(Sys.time(), report_tz)
+generated_at_sen <- paste0(
+  "Issued at ",
+  format(generated_at, "%H:%M %B %d, %Y"),
+  " ",
+  format(generated_at, "%Z")
+)
+
+burn_points <- run_info |>
+  select(run_id, burn_name, label, lat, lon, acres)
+
+map_bounds <- list(
+  xmin = min(run_info$xmin, na.rm = TRUE),
+  ymin = min(run_info$ymin, na.rm = TRUE),
+  xmax = max(run_info$xmax, na.rm = TRUE),
+  ymax = max(run_info$ymax, na.rm = TRUE)
+)
+
+outlook_path <- file.path(tempdir(), paste0("multi_burn_", as.integer(Sys.time())))
+dir.create(outlook_path, showWarnings = FALSE, recursive = TRUE)
+
+template_raster <- make_template_raster(run_info)
+template_bounds <- list(
+  xmin = terra::xmin(template_raster),
+  ymin = terra::ymin(template_raster),
+  xmax = terra::xmax(template_raster),
+  ymax = terra::ymax(template_raster)
+)
+```
+
+```{r monitors, include=FALSE}
+monitor_center <- tibble(
+  longitude = mean(run_info$lon, na.rm = TRUE),
+  latitude = mean(run_info$lat, na.rm = TRUE)
+)
+
+burn_spread_m <- tryCatch({
+  pts <- sf::st_as_sf(run_info, coords = c("lon", "lat"), crs = 4326)
+  pts_m <- sf::st_transform(pts, 5070)
+  as.numeric(max(sf::st_distance(pts_m)))
+}, error = function(e) 0)
+
+monitor_radius <- max(300000, burn_spread_m + 100000, na.rm = TRUE)
+startdate <- as.Date(params$BURN_DATE) - 3
+enddate <- as.Date(params$BURN_DATE) - 1
+
+rec_daily_df <- tryCatch({
+  near_mon <- AirMonitor::monitor_loadLatest() |>
+    AirMonitor::monitor_filterDistance(
+      longitude = monitor_center$longitude,
+      latitude = monitor_center$latitude,
+      radius = monitor_radius,
+      addToMeta = TRUE
+    ) |>
+    AirMonitor::monitor_arrange(distanceFromTarget) |>
+    AirMonitor::monitor_slice_head(40)
+
+  near_mon$data |>
+    mutate(datetime = ymd(as_date(datetime))) |>
+    filter(datetime >= startdate & datetime <= enddate) |>
+    group_by(datetime) |>
+    summarise_all(.funs = mean, na.rm = TRUE) |>
+    ungroup() |>
+    tidyr::gather(deviceDeploymentID, pm_val, -datetime) |>
+    mutate(
+      aqi_col = AirMonitor::aqiColors(pm_val, pollutant = "PM2.5", palette = "EPA"),
+      aqi_cat = cut(pm_val, breaks = AirMonitor::US_AQI$breaks_AQI, labels = AirMonitor::US_AQI$names_eng)
+    ) |>
+    left_join(near_mon$meta, by = "deviceDeploymentID") |>
+    mutate(
+      siteName = stringr::str_to_title(locationName),
+      mon_v5_url = paste0(
+        '<a href="https://tools.airfire.org/monitoring/v5/?centerlat=',
+        latitude,
+        '&centerlon=',
+        longitude,
+        '&zoom=9&monitors=',
+        deviceDeploymentID,
+        '" target="_blank">',
+        siteName,
+        '</a>'
+      )
+    ) |>
+    filter(datetime == max(datetime))
+}, error = function(e) NULL)
+
+perm_mon_df <- if (!is.null(rec_daily_df)) dplyr::filter(rec_daily_df, deploymentType == "Permanent") else NULL
+temp_mon_df <- if (!is.null(rec_daily_df)) dplyr::filter(rec_daily_df, deploymentType == "Temporary") else NULL
+```
+
+```{r combine_daily, include=FALSE}
+daily_dir <- file.path(outlook_path, "daily")
+dir.create(daily_dir, showWarnings = FALSE, recursive = TRUE)
+
+daily_urls <- purrr::map_chr(seq_len(nrow(run_info)), function(i) get_daily_pm25_png_url(run_info[i, ]))
+daily_files <- file.path(daily_dir, paste0(run_info$run_id, "_daily.png"))
+purrr::walk2(daily_urls, daily_files, download_file_safe)
+
+daily_bounds <- purrr::map(seq_len(nrow(run_info)), function(i) {
+  list(xmin = run_info$xmin[i], ymin = run_info$ymin[i], xmax = run_info$xmax[i], ymax = run_info$ymax[i])
+})
+
+daily_combined <- combine_pm25_pngs(
+  png_files = daily_files,
+  bounds_list = daily_bounds,
+  template_raster = template_raster,
+  out_png = file.path(outlook_path, "combined_daily_exposure_index.png")
+)
+
+daily_png_uri <- base64enc::dataURI(file = daily_combined$png, mime = "image/png")
+```
+
+```{r combine_hourly, include=FALSE}
+hourly_dir <- file.path(outlook_path, "hourly")
+dir.create(hourly_dir, showWarnings = FALSE, recursive = TRUE)
+
+hourly_index <- purrr::map_dfr(seq_len(nrow(run_info)), function(i) {
+  idx <- get_hourly_pm25_png_index(run_info[i, ])
+  idx$run_i <- i
+  idx
+})
+
+common_times <- sort(unique(hourly_index$datetime_utc))
+
+# Limit extremely long output while preserving the modeled hourly period.
+# Remove or raise this if desired.
+common_times <- common_times[seq_len(min(length(common_times), 72))]
+
+hourly_outputs <- purrr::map(seq_along(common_times), function(j) {
+  t <- common_times[j]
+  rows <- hourly_index |> filter(datetime_utc == t)
+
+  files <- purrr::map_chr(seq_len(nrow(rows)), function(k) {
+    f <- file.path(hourly_dir, paste0(rows$run_id[k], "_", format(t, "%Y%m%d%H%M"), ".png"))
+    download_file_safe(rows$url[k], f)
+  })
+
+  bounds <- purrr::map(rows$run_i, function(i) {
+    list(xmin = run_info$xmin[i], ymin = run_info$ymin[i], xmax = run_info$xmax[i], ymax = run_info$ymax[i])
+  })
+
+  out_png <- file.path(hourly_dir, paste0("combined_hourly_", format(t, "%Y%m%d%H%M"), ".png"))
+  combine_pm25_pngs(files, bounds, template_raster, out_png)$png
+})
+
+hourly_png_data <- purrr::map_chr(hourly_outputs, ~ base64enc::dataURI(file = .x, mime = "image/png"))
+hourly_labels <- format(lubridate::with_tz(common_times, report_tz), "%H:%M %b %d, %Y")
+```
+
+```{r leaflet_helpers, include=FALSE}
+add_burn_and_monitor_layers <- function(map) {
+  map <- map |>
+    addMarkers(
+      data = burn_points,
+      lng = ~lon,
+      lat = ~lat,
+      icon = list(
+        iconUrl = fire_icon_uri,
+        iconWidth = 24,
+        iconHeight = 24,
+        iconAnchorX = 12,
+        iconAnchorY = 12
+      ),
+      label = ~label,
+      popup = ~paste0("<b>", label, "</b><br/>Acres: ", round(acres, 1)),
+      group = "Burn units"
+    )
+
+  if (!is.null(temp_mon_df) && nrow(temp_mon_df) > 0) {
+    map <- map |>
+      addMarkers(
+        data = temp_mon_df,
+        lng = ~longitude,
+        lat = ~latitude,
+        icon = list(iconUrl = temp_mon_icon_uri, iconSize = c(15, 15)),
+        popup = ~mon_v5_url,
+        label = ~paste0(siteName, ": ", round(pm_val, 1), " µg/m³"),
+        group = "Temporary monitors"
+      )
+  }
+
+  if (!is.null(perm_mon_df) && nrow(perm_mon_df) > 0) {
+    map <- map |>
+      addCircleMarkers(
+        data = perm_mon_df,
+        lng = ~longitude,
+        lat = ~latitude,
+        fillColor = ~aqi_col,
+        fillOpacity = 1,
+        stroke = TRUE,
+        color = "black",
+        popup = ~mon_v5_url,
+        label = ~paste0(siteName, ": ", round(pm_val, 1), " µg/m³"),
+        radius = 8,
+        weight = 1,
+        group = "Permanent monitors"
+      )
+  }
+
+  map
+}
+
+fit_to_runs <- function(map) {
+  pad <- 0.5
+  map |>
+    fitBounds(
+      lng1 = min(run_info$lon, na.rm = TRUE) - pad,
+      lat1 = min(run_info$lat, na.rm = TRUE) - pad,
+      lng2 = max(run_info$lon, na.rm = TRUE) + pad,
+      lat2 = max(run_info$lat, na.rm = TRUE) + pad
+    )
+}
+```
+
+```{r make_maps, include=FALSE}
+daily_leaflet <- leaflet() |>
+  addProviderTiles(providers$CartoDB.Voyager, group = "Street") |>
+  addProviderTiles("Esri.WorldImagery", group = "Terrain") |>
+  addMapPane("smoke_map", zIndex = 460) |>
+  addMapPane("marker_map", zIndex = 700) |>
+  addLegend(
+    colors = exposure_cols,
+    labels = exposure_labels,
+    title = htmltools::HTML("Combined Smoke Exposure"),
+    opacity = 1
+  ) |>
+  add_burn_and_monitor_layers() |>
+  fit_to_runs() |>
+  addScaleBar(position = "bottomright") |>
+  addLayersControl(
+    overlayGroups = c("Burn units", "Permanent monitors", "Temporary monitors"),
+    baseGroups = c("Street", "Terrain"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) |>
+  htmlwidgets::onRender(
+    "
+    function(el, x, data) {
+      var map = this;
+      var bounds = [[data.ymin, data.xmin], [data.ymax, data.xmax]];
+      L.imageOverlay(data.url, bounds, {
+        opacity: 1,
+        pane: 'smoke_map',
+        className: 'png-raster-overlay'
+      }).addTo(map);
+    }
+    ",
+    data = list(
+      url = daily_png_uri,
+      xmin = template_bounds$xmin,
+      ymin = template_bounds$ymin,
+      xmax = template_bounds$xmax,
+      ymax = template_bounds$ymax
+    )
+  )
+
+hourly_leaflet <- leaflet() |>
+  addProviderTiles(providers$CartoDB.Voyager, group = "Street") |>
+  addProviderTiles("Esri.WorldImagery", group = "Terrain") |>
+  addMapPane("hourly_smoke_map", zIndex = 460) |>
+  addMapPane("hourly_marker_map", zIndex = 700) |>
+  addLegend(
+    colors = exposure_cols,
+    labels = exposure_labels,
+    title = htmltools::HTML("Combined Smoke Exposure"),
+    opacity = 1
+  ) |>
+  add_burn_and_monitor_layers() |>
+  fit_to_runs() |>
+  addScaleBar(position = "bottomright") |>
+  addLayersControl(
+    overlayGroups = c("Burn units", "Permanent monitors", "Temporary monitors"),
+    baseGroups = c("Street", "Terrain"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) |>
+  htmlwidgets::onRender(
+    "
+    function(el, x, data) {
+      var map = this;
+      var bounds = [[data.ymin, data.xmin], [data.ymax, data.xmax]];
+      var overlays = data.urls.map(function(url) {
+        return L.imageOverlay(url, bounds, {
+          opacity: 1,
+          pane: 'hourly_smoke_map',
+          className: 'png-raster-overlay'
+        });
+      });
+
+      var currentIndex = 0;
+      overlays[currentIndex].addTo(map);
+
+      var sliderControl = L.control({position: 'bottomleft'});
+      sliderControl.onAdd = function(map) {
+        var div = L.DomUtil.create('div', 'hourly-slider-control leaflet-bar');
+        div.innerHTML = `
+          <div class='hourly-slider-title'>Hourly Combined Exposure</div>
+          <div class='hourly-slider-label' id='hourly-label-${el.id}'>${data.labels[0]}</div>
+          <div class='hourly-slider-row'>
+            <button type='button' class='hourly-step-button' id='hourly-prev-${el.id}'>&#9664;</button>
+            <input id='hourly-slider-${el.id}' type='range' min='0' max='${data.urls.length - 1}' value='0' step='1'>
+            <button type='button' class='hourly-step-button' id='hourly-next-${el.id}'>&#9654;</button>
+          </div>
+        `;
+        L.DomEvent.disableClickPropagation(div);
+        L.DomEvent.disableScrollPropagation(div);
+        return div;
+      };
+      sliderControl.addTo(map);
+
+      var slider = document.getElementById('hourly-slider-' + el.id);
+      var label = document.getElementById('hourly-label-' + el.id);
+      var prevButton = document.getElementById('hourly-prev-' + el.id);
+      var nextButton = document.getElementById('hourly-next-' + el.id);
+
+      function setStep(index) {
+        var maxIndex = data.urls.length - 1;
+        var newIndex = Math.max(0, Math.min(maxIndex, index));
+        if (map.hasLayer(overlays[currentIndex])) map.removeLayer(overlays[currentIndex]);
+        overlays[newIndex].addTo(map);
+        currentIndex = newIndex;
+        slider.value = newIndex;
+        label.innerHTML = data.labels[newIndex];
+        if (prevButton) prevButton.disabled = newIndex === 0;
+        if (nextButton) nextButton.disabled = newIndex === maxIndex;
+      }
+
+      slider.addEventListener('input', function(e) { setStep(parseInt(e.target.value)); });
+      slider.addEventListener('change', function(e) { setStep(parseInt(e.target.value)); });
+      prevButton.addEventListener('click', function(e) { e.preventDefault(); setStep(parseInt(slider.value) - 1); });
+      nextButton.addEventListener('click', function(e) { e.preventDefault(); setStep(parseInt(slider.value) + 1); });
+      setStep(0);
+    }
+    ",
+    data = list(
+      urls = hourly_png_data,
+      labels = hourly_labels,
+      xmin = template_bounds$xmin,
+      ymin = template_bounds$ymin,
+      xmax = template_bounds$xmax,
+      ymax = template_bounds$ymax
+    )
+  )
+```
+
+```{=html}
+<style>
+.report-title-banner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 18px;
+  margin: 18px 0 16px 0;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #032B5B, #24527A);
+  color: white;
+}
+.report-title-banner img { width: 58px; height: 58px; }
+.report-title-main { font-size: 30px; font-weight: 800; line-height: 1.1; }
+.report-title-sub { font-size: 18px; font-weight: 500; opacity: 0.95; margin-top: 4px; }
+.hourly-slider-control {
+  background: white;
+  padding: 8px 10px;
+  border-radius: 6px;
+  box-shadow: 0 1px 5px rgba(0,0,0,0.35);
+}
+.hourly-slider-title { font-weight: 700; margin-bottom: 3px; }
+.hourly-slider-label { font-size: 13px; margin-bottom: 5px; }
+.hourly-slider-row { display: flex; align-items: center; gap: 5px; }
+.hourly-slider-row input { width: 220px; }
+.hourly-step-button { font-weight: 700; }
+.png-raster-overlay { image-rendering: pixelated; image-rendering: crisp-edges; }
+</style>
+```
+
+```{r title_block, results='asis'}
+cat(paste0(
+  '<div class="report-title-banner">',
+  '<img src="', report_icon_uri, '" alt="Smoke report icon">',
+  '<div>',
+  '<div class="report-title-main">', htmltools::htmlEscape(params$PROJECT_NAME), '</div>',
+  '<div class="report-title-sub">Multi-burn Exposure</div>',
+  '</div>',
+  '</div>'
+))
+cat("\n\n**", generated_at_sen, "**\n\n", sep = "")
+```
+
+## Included BlueSky Runs
+
+```{r run_table}
+run_info |>
+  transmute(
+    `Burn/unit name` = if_else(is.na(burn_name) | burn_name == "", "—", burn_name),
+    `Run ID` = run_id,
+    Latitude = round(lat, 4),
+    Longitude = round(lon, 4),
+    Acres = round(acres, 1)
+  ) |>
+  knitr::kable()
+```
+
+## Combined Daily Exposure Index
+
+```{r daily_map_show, out.width='100%'}
+daily_leaflet
+```
+
+## Combined Hourly Exposure Index
+
+```{r hourly_map_show, out.width='100%'}
+hourly_leaflet
+```
+
+```{r log_file, include=FALSE}
+log_row <- list(
+  report_type = "Multi-burn Exposure",
+  region = NA,
+  forest = NA,
+  burn_name = params$PROJECT_NAME,
+  burn_date = as.Date(params$BURN_DATE),
+  date_issued = Sys.Date(),
+  lat = mean(run_info$lat, na.rm = TRUE),
+  lon = mean(run_info$lon, na.rm = TRUE),
+  acreage = sum(run_info$acres, na.rm = TRUE),
+  run_id = paste(run_info$run_id, collapse = "; "),
+  superfog_potential = NA,
+  report_url = params$REPORT_URL,
+  pb_map_url = NA
+)
+
+saveRDS(log_row, params$LOG_ROW_FILE)
+unlink(outlook_path, recursive = TRUE)
+```
