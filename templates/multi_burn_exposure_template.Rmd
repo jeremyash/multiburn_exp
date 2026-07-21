@@ -36,6 +36,7 @@ library(RCurl)
 library(rjson)
 library(curl)
 
+source(here::here("R", "helpers.R"))
 source(here::here("R", "multi_burn_helpers.R"))
 
 make_data_uri <- function(path, mime = "image/png") {
@@ -74,11 +75,21 @@ run_info <- purrr::map2_dfr(
   read_bluesky_run_info
 )
 
-report_tz <- lutz::tz_lookup_coords(
-  lat = mean(run_info$lat, na.rm = TRUE),
-  lon = mean(run_info$lon, na.rm = TRUE),
-  method = "fast"
+report_tz <- tryCatch(
+  lutz::tz_lookup_coords(
+    lat = mean(run_info$lat, na.rm = TRUE),
+    lon = mean(run_info$lon, na.rm = TRUE),
+    method = "fast"
+  ),
+  error = function(e) run_info$tz[1]
 )
+
+if (
+  is.na(report_tz) ||
+  !nzchar(report_tz)
+) {
+  report_tz <- run_info$tz[1]
+}
 
 generated_at <- lubridate::with_tz(Sys.time(), report_tz)
 generated_at_sen <- paste0(
@@ -172,61 +183,283 @@ temp_mon_df <- if (!is.null(rec_daily_df)) dplyr::filter(rec_daily_df, deploymen
 
 ```{r combine_daily, include=FALSE}
 daily_dir <- file.path(outlook_path, "daily")
-dir.create(daily_dir, showWarnings = FALSE, recursive = TRUE)
 
-daily_urls <- purrr::map_chr(seq_len(nrow(run_info)), function(i) get_daily_pm25_png_url(run_info[i, ]))
-daily_files <- file.path(daily_dir, paste0(run_info$run_id, "_daily.png"))
-purrr::walk2(daily_urls, daily_files, download_file_safe)
+dir.create(
+  daily_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
 
-daily_bounds <- purrr::map(seq_len(nrow(run_info)), function(i) {
-  list(xmin = run_info$xmin[i], ymin = run_info$ymin[i], xmax = run_info$xmax[i], ymax = run_info$ymax[i])
-})
+
+# Find the available daily-average PNG for each run.
+
+daily_index <- purrr::map_dfr(
+  seq_len(nrow(run_info)),
+  function(i) {
+
+    idx <- get_daily_pm25_png_index(
+      run_info[i, ]
+    )
+
+    if (nrow(idx) == 0) {
+      stop(
+        "No daily-average PM2.5 PNG found for BlueSky run ID: ",
+        run_info$run_id[i]
+      )
+    }
+
+
+    # There should normally be one relevant rendered
+    # daily-average PNG for the run.
+
+    idx |>
+      dplyr::slice_head(n = 1) |>
+      dplyr::mutate(
+        run_i = i
+      )
+  }
+)
+
+
+daily_files <- purrr::map_chr(
+  seq_len(nrow(daily_index)),
+  function(i) {
+
+    dest <- file.path(
+      daily_dir,
+      paste0(
+        daily_index$run_id[i],
+        "_daily.png"
+      )
+    )
+
+
+    download_file_safe(
+      daily_index$url[i],
+      dest
+    )
+  }
+)
+
+
+daily_bounds <- purrr::map(
+  daily_index$run_i,
+  function(i) {
+
+    list(
+      xmin = run_info$xmin[i],
+      ymin = run_info$ymin[i],
+      xmax = run_info$xmax[i],
+      ymax = run_info$ymax[i]
+    )
+  }
+)
+
 
 daily_combined <- combine_pm25_pngs(
   png_files = daily_files,
   bounds_list = daily_bounds,
-  template_raster = template_raster,
-  out_png = file.path(outlook_path, "combined_daily_exposure_index.png")
+  template_raster = template_raster
 )
 
-daily_png_uri <- base64enc::dataURI(file = daily_combined$png, mime = "image/png")
+
+daily_png <- file.path(
+  outlook_path,
+  "combined_daily_exposure_index.png"
+)
+
+
+write_exposure_index_raster_png(
+  daily_combined,
+  daily_png,
+  breaks = daily_exposure_breaks
+)
+
+
+daily_png_uri <- base64enc::dataURI(
+  file = daily_png,
+  mime = "image/png"
+)
 ```
 
 ```{r combine_hourly, include=FALSE}
-hourly_dir <- file.path(outlook_path, "hourly")
-dir.create(hourly_dir, showWarnings = FALSE, recursive = TRUE)
+hourly_dir <- file.path(
+  outlook_path,
+  "hourly"
+)
 
-hourly_index <- purrr::map_dfr(seq_len(nrow(run_info)), function(i) {
-  idx <- get_hourly_pm25_png_index(run_info[i, ])
-  idx$run_i <- i
-  idx
-})
+dir.create(
+  hourly_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
 
-common_times <- sort(unique(hourly_index$datetime_utc))
 
-# Limit extremely long output while preserving the modeled hourly period.
-# Remove or raise this if desired.
-common_times <- common_times[seq_len(min(length(common_times), 72))]
+# Build one UTC-indexed table containing the
+# hourly images available for every run.
 
-hourly_outputs <- purrr::map(seq_along(common_times), function(j) {
-  t <- common_times[j]
-  rows <- hourly_index |> filter(datetime_utc == t)
+hourly_index <- purrr::map_dfr(
+  seq_len(nrow(run_info)),
+  function(i) {
 
-  files <- purrr::map_chr(seq_len(nrow(rows)), function(k) {
-    f <- file.path(hourly_dir, paste0(rows$run_id[k], "_", format(t, "%Y%m%d%H%M"), ".png"))
-    download_file_safe(rows$url[k], f)
-  })
+    idx <- get_hourly_pm25_png_index(
+      run_info[i, ]
+    )
 
-  bounds <- purrr::map(rows$run_i, function(i) {
-    list(xmin = run_info$xmin[i], ymin = run_info$ymin[i], xmax = run_info$xmax[i], ymax = run_info$ymax[i])
-  })
+    if (nrow(idx) == 0) {
+      return(
+        tibble::tibble()
+      )
+    }
 
-  out_png <- file.path(hourly_dir, paste0("combined_hourly_", format(t, "%Y%m%d%H%M"), ".png"))
-  combine_pm25_pngs(files, bounds, template_raster, out_png)$png
-})
 
-hourly_png_data <- purrr::map_chr(hourly_outputs, ~ base64enc::dataURI(file = .x, mime = "image/png"))
-hourly_labels <- format(lubridate::with_tz(common_times, report_tz), "%H:%M %b %d, %Y")
+    idx |>
+      dplyr::mutate(
+        run_i = i
+      )
+  }
+)
+
+
+if (nrow(hourly_index) == 0) {
+  stop(
+    "No hourly PM2.5 PNGs were found for the supplied BlueSky runs."
+  )
+}
+
+
+# Use every modeled absolute time represented
+# by at least one run.
+
+common_times <- sort(
+  unique(
+    hourly_index$datetime_utc
+  )
+)
+
+
+# Keep a reasonable upper limit for the
+# self-contained HTML report.
+
+if (length(common_times) > 72) {
+  common_times <- common_times[
+    seq_len(72)
+  ]
+}
+
+
+hourly_outputs <- purrr::map_chr(
+  seq_along(common_times),
+  function(j) {
+
+    current_time <- common_times[j]
+
+
+    # Only runs that have output at this exact
+    # UTC time contribute to this frame.
+
+    rows <- hourly_index |>
+      dplyr::filter(
+        datetime_utc == current_time
+      )
+
+
+    downloaded_files <- purrr::map_chr(
+      seq_len(nrow(rows)),
+      function(k) {
+
+        dest <- file.path(
+          hourly_dir,
+          paste0(
+            rows$run_id[k],
+            "_",
+            format(
+              current_time,
+              "%Y%m%d%H%M",
+              tz = "UTC"
+            ),
+            ".png"
+          )
+        )
+
+
+        download_file_safe(
+          rows$url[k],
+          dest
+        )
+      }
+    )
+
+
+    frame_bounds <- purrr::map(
+      rows$run_i,
+      function(i) {
+
+        list(
+          xmin = run_info$xmin[i],
+          ymin = run_info$ymin[i],
+          xmax = run_info$xmax[i],
+          ymax = run_info$ymax[i]
+        )
+      }
+    )
+
+
+    combined_raster <- combine_pm25_pngs(
+      png_files = downloaded_files,
+      bounds_list = frame_bounds,
+      template_raster = template_raster
+    )
+
+
+    out_png <- file.path(
+      hourly_dir,
+      paste0(
+        "combined_hourly_",
+        format(
+          current_time,
+          "%Y%m%d%H%M",
+          tz = "UTC"
+        ),
+        ".png"
+      )
+    )
+
+
+    write_exposure_index_raster_png(
+      combined_raster,
+      out_png,
+      breaks = hourly_exposure_breaks
+    )
+
+
+    out_png
+  }
+)
+
+
+hourly_png_data <- purrr::map_chr(
+  hourly_outputs,
+  function(path) {
+
+    base64enc::dataURI(
+      file = path,
+      mime = "image/png"
+    )
+  }
+)
+
+
+# UTC is used internally for matching the runs,
+# but the report displays one local timeline.
+
+hourly_labels <- format(
+  lubridate::with_tz(
+    common_times,
+    report_tz
+  ),
+  "%H:%M %b %d, %Y"
+)
 ```
 
 ```{r leaflet_helpers, include=FALSE}
@@ -242,6 +475,9 @@ add_burn_and_monitor_layers <- function(map) {
         iconHeight = 24,
         iconAnchorX = 12,
         iconAnchorY = 12
+      ),
+      options = markerOptions(
+        pane = "marker_map"
       ),
       label = ~label,
       popup = ~paste0("<b>", label, "</b><br/>Acres: ", round(acres, 1)),
@@ -338,8 +574,14 @@ daily_leaflet <- leaflet() |>
 hourly_leaflet <- leaflet() |>
   addProviderTiles(providers$CartoDB.Voyager, group = "Street") |>
   addProviderTiles("Esri.WorldImagery", group = "Terrain") |>
-  addMapPane("hourly_smoke_map", zIndex = 460) |>
-  addMapPane("hourly_marker_map", zIndex = 700) |>
+  addMapPane(
+    "smoke_map",
+    zIndex = 460
+  ) |>
+  addMapPane(
+    "marker_map",
+    zIndex = 700
+  ) |>
   addLegend(
     colors = exposure_cols,
     labels = exposure_labels,
@@ -362,7 +604,7 @@ hourly_leaflet <- leaflet() |>
       var overlays = data.urls.map(function(url) {
         return L.imageOverlay(url, bounds, {
           opacity: 1,
-          pane: 'hourly_smoke_map',
+          pane: 'smoke_map',
           className: 'png-raster-overlay'
         });
       });

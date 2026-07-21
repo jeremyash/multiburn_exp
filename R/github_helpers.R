@@ -110,7 +110,7 @@ update_index_page <- function(
     owner,
     repo,
     report_filename,
-    report_type = c("report", "pb"),
+    report_type = c("report", "pb", "mb"),
     region,
     forest,
     burn_name,
@@ -145,11 +145,16 @@ update_index_page <- function(
     product_label <- "Smoke Report"
     start_marker <- "<!-- ===== BEGIN AUTO-GENERATED SMOKE REPORT LINKS ===== -->"
     empty_pattern <- "<p class=\"empty\">\\s*No reports available yet\\.\\s*</p>"
-  } else {
+  } else if (report_type == "pb") {
     href <- paste0("pb/", report_filename)
     product_label <- "PB Piedmont"
     start_marker <- "<!-- ===== BEGIN AUTO-GENERATED PB PIEDMONT LINKS ===== -->"
     empty_pattern <- "<p class=\"empty\">\\s*No PB Piedmont maps available yet\\.\\s*</p>"
+  } else if (report_type == "mb") {
+    href <- paste0("mb/", report_filename)
+    product_label <- "Multi-burn Exposure"
+    start_marker <- "<!-- ===== BEGIN AUTO-GENERATED MULTI-BURN EXPOSURE LINKS ===== -->"
+    empty_pattern <- "<p class=\"empty\">\\s*No multi-burn exposure reports available yet\\.\\s*</p>"
   }
   
   if (!grepl(start_marker, index_html, fixed = TRUE)) {

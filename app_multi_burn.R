@@ -1,27 +1,25 @@
 # app_multi_burn.R
 # Standalone Shiny app for Multi-burn Exposure reports
-
-require(shiny)
-require(tidyverse)
-require(rmarkdown)
-require(lubridate)
-require(shinyjs)
-require(here)
-require(RCurl)
-require(rjson)
-require(curl)
-require(jsonlite)
-require(googlesheets4)
-require(gh)
-require(fs)
+library(shiny)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(lubridate)
+library(lutz)
+library(leaflet)
+library(rmarkdown)
+library(gh)
+library(base64enc)
+library(googlesheets4)
+library(viridisLite)
 
 source("R/constants.R")
 source("R/helpers.R")
-source("R/ui_helpers.R")
-source("R/validation_helpers.R")
 source("R/filename_helpers.R")
 source("R/github_helpers.R")
 source("R/log_helpers.R")
+source("R/validation_helpers.R")
+source("R/ui_helpers.R")
 source("R/multi_burn_helpers.R")
 
 LOG_SHEET_URL <- get_log_sheet_url()
@@ -205,21 +203,22 @@ server <- function(input, output, session) {
           if (file.exists(log_row_file)) {
             log_row <- readRDS(log_row_file)
             safe_append_smoke_app_log(
-              sheet_url = LOG_SHEET_URL,
-              report_type = log_row$report_type,
-              region = log_row$region,
-              forest = log_row$forest,
-              burn_name = log_row$burn_name,
-              burn_date = log_row$burn_date,
-              date_issued = log_row$date_issued,
-              lat = log_row$lat,
-              lon = log_row$lon,
-              acreage = log_row$acreage,
-              run_id = log_row$run_id,
-              superfog_potential = log_row$superfog_potential,
-              report_url = uploaded_url,
-              pb_map_url = log_row$pb_map_url,
-              context = "Multi-burn Exposure log"
+              sheet_url = get_log_sheet_url(),
+              report_type = "Multi-burn Exposure",
+              region = NA,
+              forest = NA,
+              burn_name = input$PROJECT_NAME,
+              burn_date = input$BURN_DATE,
+              date_issued = issued_at,
+              lat = NA,
+              lon = NA,
+              acreage = NA,
+              run_id = paste(valid_runs$run_id, collapse = "; "),
+              superfog_potential = NA,
+              day_before_or_of = NA,
+              report_url = report_url,
+              pb_map_url = NA,
+              context = "Multi-burn exposure log"
             )
           }
 

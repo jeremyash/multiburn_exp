@@ -2,6 +2,7 @@ APP_OWNER <- "jeremyash"
 APP_REPO <- "smoke_reports"
 APP_BRANCH <- "main"
 
+MB_PAGES_DIR <- "docs/mb"
 REPORT_PAGES_DIR <- "docs/sr"
 PB_PAGES_DIR <- "docs/pb"
 
